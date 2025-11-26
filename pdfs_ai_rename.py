@@ -4,8 +4,9 @@ import re
 import shutil
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
 from openai import OpenAI
@@ -71,14 +72,30 @@ def request_batch_upload_links(file_paths: Iterable[str], config: MinerUConfig) 
 
 
 def upload_files_to_urls(file_paths: Iterable[str], file_urls: Iterable[str]) -> None:
-    """将本地文件逐个上传到 MinerU 返回的预签名 URL。"""
+    """将本地文件上传到 MinerU 预签名 URL，失败不阻塞其他文件。"""
 
-    for file_path, url in zip(file_paths, file_urls):
-        with open(file_path, "rb") as f:
-            upload_resp = requests.put(url, data=f, timeout=300)
-        if upload_resp.status_code != 200:
-            raise RuntimeError(f"文件 {file_path} 上传失败: {upload_resp.text}")
-        print(f"Upload success -> {file_path}")
+    def _upload(one_file: str, one_url: str) -> Tuple[str, bool, str]:
+        try:
+            with open(one_file, "rb") as f:
+                resp = requests.put(one_url, data=f, timeout=300)
+            if resp.status_code != 200:
+                return one_file, False, resp.text
+            return one_file, True, ""
+        except Exception as exc:  # 捕获单文件错误，避免打断其他上传
+            return one_file, False, str(exc)
+
+    file_list = list(file_paths)
+    url_list = list(file_urls)
+    max_workers = min(8, len(file_list)) or 1
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_upload, fp, url) for fp, url in zip(file_list, url_list)]
+        for fut in as_completed(futures):
+            file_path, ok, err = fut.result()
+            if ok:
+                print(f"Upload success -> {file_path}")
+            else:
+                print(f"Upload failed -> {file_path}: {err}")
 
 
 def poll_batch_results(batch_id: str, config: MinerUConfig, interval: int = 10, max_attempts: int = 60) -> List[Dict]:
@@ -128,7 +145,14 @@ def extract_markdown_from_zip(zip_path: str, output_dir: str) -> str:
         if not markdown_files:
             raise FileNotFoundError("压缩包中未找到 Markdown 文件")
         first_md = markdown_files[0]
-        output_path = os.path.join(output_dir, os.path.basename(first_md))
+        # 如存在同名文件，追加计数后缀避免冲突
+        base_output = os.path.join(output_dir, os.path.basename(first_md))
+        output_path = base_output
+        counter = 1
+        while os.path.exists(output_path):
+            stem, ext = os.path.splitext(base_output)
+            output_path = f"{stem}_{counter}{ext}"
+            counter += 1
         zf.extract(first_md, output_dir)
         # 如果 ZIP 内有子目录，统一移动到输出目录根部
         extracted_path = os.path.join(output_dir, first_md)
@@ -156,11 +180,14 @@ def fetch_markdown_results(extract_results: List[Dict], workspace: str) -> Dict[
             print(f"文件 {file_name} 无 zip 链接，跳过")
             continue
 
-        local_zip = os.path.join(workspace, f"{os.path.splitext(file_name)[0]}.zip")
-        download_zip(zip_url, local_zip)
-        markdown_path = extract_markdown_from_zip(local_zip, workspace)
-        markdown_map[file_name] = markdown_path
-        print(f"Markdown extracted for {file_name} -> {markdown_path}")
+        try:
+            local_zip = os.path.join(workspace, f"{os.path.splitext(file_name)[0]}.zip")
+            download_zip(zip_url, local_zip)
+            markdown_path = extract_markdown_from_zip(local_zip, workspace)
+            markdown_map[file_name] = markdown_path
+            print(f"Markdown extracted for {file_name} -> {markdown_path}")
+        except Exception as exc:
+            print(f"下载或解压 {file_name} 失败: {exc}")
 
     return markdown_map
 
@@ -185,6 +212,8 @@ def build_prompt(markdown_text: str) -> str:
 def parse_json_response(text: str) -> Dict:
     """将模型返回的字符串解析为 JSON 对象，并在失败时给出可读错误。"""
 
+    # 去掉可能存在的 Markdown 代码块包裹
+    text = re.sub(r"```[a-zA-Z]*\n|```", "", text).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -197,10 +226,22 @@ def parse_json_response(text: str) -> Dict:
         raise ValueError(f"模型返回内容不是合法 JSON: {text}")
 
 
+_openai_client_cache: Dict[Tuple[str, Optional[str]], OpenAI] = {}
+
+
+def _get_cached_openai_client(config: ModelConfig) -> OpenAI:
+    """缓存并复用 OpenAI 兼容客户端，减少重复连接开销。"""
+
+    key = (config.api_base or "", config.api_key)
+    if key not in _openai_client_cache:
+        _openai_client_cache[key] = OpenAI(api_key=config.api_key, base_url=config.api_base)
+    return _openai_client_cache[key]
+
+
 def call_openai_like_model(prompt: str, config: ModelConfig) -> str:
     """通过 OpenAI 兼容接口（OpenAI/ollama/LM Studio 等）获取回复。"""
 
-    client = OpenAI(api_key=config.api_key, base_url=config.api_base)
+    client = _get_cached_openai_client(config)
     response = client.chat.completions.create(
         model=config.model,
         messages=[{"role": "user", "content": prompt}],
@@ -227,7 +268,8 @@ def call_gemini_model(prompt: str, config: ModelConfig) -> str:
 def generate_metadata(markdown_text: str, model_cfg: ModelConfig) -> Dict:
     """根据 Markdown 内容调用用户指定模型，生成结构化元数据。"""
 
-    prompt = build_prompt(markdown_text)
+    # 为避免长文档导致模型上下文溢出，仅截取前 10k 字符
+    prompt = build_prompt(markdown_text[:10000])
     if model_cfg.provider.lower() in {"openai", "ollama", "lm_studio"}:
         raw_text = call_openai_like_model(prompt, model_cfg)
     elif model_cfg.provider.lower() == "gemini":
@@ -247,6 +289,21 @@ def sanitize_filename(name: str) -> str:
 
     cleaned = re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5_\-]+", "_", name).strip("._")
     return cleaned[:80] or "untitled"
+
+
+def ensure_unique_path(path: str) -> str:
+    """若目标文件已存在，追加计数后缀避免覆盖。"""
+
+    if not os.path.exists(path):
+        return path
+
+    stem, ext = os.path.splitext(path)
+    counter = 1
+    new_path = f"{stem}_{counter}{ext}"
+    while os.path.exists(new_path):
+        counter += 1
+        new_path = f"{stem}_{counter}{ext}"
+    return new_path
 
 
 def default_rename_rule(metadata: Dict, original_basename: str) -> str:
@@ -277,7 +334,7 @@ def rename_files_with_metadata(
     for original_name, metadata in metadata_map.items():
         base = os.path.splitext(original_name)[0]
         new_base = sanitize_filename(rename_rule(metadata, base))
-        new_path = os.path.join(target_dir, new_base + ".pdf")
+        new_path = ensure_unique_path(os.path.join(target_dir, new_base + ".pdf"))
 
         src_path = os.path.join(directory, original_name)
         if not os.path.exists(src_path):
@@ -320,18 +377,28 @@ def run_pipeline(
 
     # 4) 将 Markdown 发送到指定大模型，得到 JSON 元数据
     metadata_map: Dict[str, Dict] = {}
-    for file_name, md_path in markdown_map.items():
-        with open(md_path, "r", encoding="utf-8") as f:
-            md_text = f.read()
-        metadata = generate_metadata(md_text, model_cfg)
 
-        # 将元数据另存为 JSON，方便用户自定义命名规则
-        json_path = os.path.join(workspace, f"{os.path.splitext(file_name)[0]}_metadata.json")
-        with open(json_path, "w", encoding="utf-8") as jf:
-            json.dump(metadata, jf, ensure_ascii=False, indent=2)
+    def _process_metadata(file_name: str, md_path: str) -> Tuple[str, Optional[Dict]]:
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                md_text = f.read()
+            metadata = generate_metadata(md_text, model_cfg)
 
-        metadata_map[file_name] = metadata
-        print(f"元数据写入: {json_path}")
+            json_path = os.path.join(workspace, f"{os.path.splitext(file_name)[0]}_metadata.json")
+            with open(json_path, "w", encoding="utf-8") as jf:
+                json.dump(metadata, jf, ensure_ascii=False, indent=2)
+            print(f"元数据写入: {json_path}")
+            return file_name, metadata
+        except Exception as exc:
+            print(f"处理 {file_name} 的元数据失败: {exc}")
+            return file_name, None
+
+    with ThreadPoolExecutor(max_workers=min(6, len(markdown_map) or 1)) as executor:
+        futures = [executor.submit(_process_metadata, fn, mp) for fn, mp in markdown_map.items()]
+        for fut in as_completed(futures):
+            file_name, metadata = fut.result()
+            if metadata:
+                metadata_map[file_name] = metadata
 
     # 5) 基于元数据重命名或复制
     rename_files_with_metadata(pdf_dir, metadata_map, mode=rename_mode)
